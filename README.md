@@ -24,15 +24,15 @@
 
 ## 具体实现
 
-![bitcoin_transaction](.\imgs_v1\bitcoin_transaction.jpg)
+![bitcoin_transaction](imgs_v1/bitcoin_transaction.jpg)
 
 ### V1最终目录结构
 
-![directory_v1](.\directory_v1.png)
+![directory_v1](imgs_v1\directory_v1.png)
 
 ### 构造Block结构体block.go（参考比特币区块结构先进行缩减构造简单版）
 
-![bitcoin_genesis](.\imgs_v1\bitcoin_genesis.jpg)
+![bitcoin_genesis](imgs_v1\imgs_v1\bitcoin_genesis.jpg)
 
 ```go
 //1. 定义结构

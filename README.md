@@ -14,7 +14,7 @@
 
 ## 签名校验图示
 
-![img](imgs_V5/sign.jpg)
+![img](imgs_v5/sign.jpg)
 
 比特币使用ECC（椭圆曲线）算法生成非对称加密对。
 

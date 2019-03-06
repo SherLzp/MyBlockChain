@@ -25,29 +25,15 @@ func NewProofOfWork(block *Block) *ProofOfWork {
 		block: block,
 	}
 
-	//hashString := "0001000000000000000000000000000000000000000000000000000000000000"
-	//tmp := big.Int{}
-	//tmp.SetString(hashString, 16)
+	//我们指定的难度值，现在是一个string类型，需要进行转换
+	targetStr := "0000100000000000000000000000000000000000000000000000000000000000"
 
-	//pow.target = &tmp
+	//引入的辅助变量，目的是将上面的难度值转成big.int
+	tmpInt := big.Int{}
+	//将难度值赋值给big.int，指定16进制的格式
+	tmpInt.SetString(targetStr, 16)
 
-	//目标值：
-	// 0001000000000000000000000000000000000000000000000000000000000000
-	//初始值
-	// 0000000000000000000000000000000000000000000000000000000000000001
-	//左移256位
-	//10000000000000000000000000000000000000000000000000000000000000000
-	//右移4位(16进制位数)
-	// 0001000000000000000000000000000000000000000000000000000000000000
-
-	targetLocal := big.NewInt(1)
-	var difficulty uint
-	difficulty = 4
-	//targetLocal.Lsh(targetLocal, 256)
-	//targetLocal.Rsh(targetLocal, difficulty)
-	targetLocal.Lsh(targetLocal, 256-difficulty)
-	pow.target = targetLocal
-
+	pow.target = &tmpInt
 	return &pow
 }
 
@@ -69,7 +55,6 @@ func (pow *ProofOfWork) Run() ([]byte, uint64) {
 
 	fmt.Println("开始挖矿...")
 	for {
-		fmt.Printf("pow : %x\r", hash)
 		//1. 拼装数据（区块的数据，还有不断变化的随机数）
 		tmp := [][]byte{
 			Uint64ToByte(block.Version),
@@ -78,7 +63,8 @@ func (pow *ProofOfWork) Run() ([]byte, uint64) {
 			Uint64ToByte(block.TimeStamp),
 			Uint64ToByte(block.Difficulty),
 			Uint64ToByte(nonce),
-			block.Data,
+			//只对区块头做哈希值，区块体通过MerkelRoot产生影响
+			//block.Data,
 		}
 
 		//将二维的切片数组链接起来，返回一个一维的切片

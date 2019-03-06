@@ -47,6 +47,10 @@ ECC-->比特币使用非对称加密算法
 
 ## 具体实现
 
+### v5最终目录结构
+
+![directory](imgs_v5/directory_v5.png)
+
 ### 创建地址
 
 #### 定义Wallet结构wallet.go

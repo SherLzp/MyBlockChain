@@ -1,728 +1,838 @@
-# 从0到1构建一条区块链----v4.0
+# 从0到1构建一条区块链----v5.0
 
-## v3版本存在的问题
+## v4版本存在的问题
 
-1. 并未实现真正的交易
-2. 无激励机制
-3. 无转账机制
+1. 地址是用字符串代替
+2. 没有校验交易
 
-## v4实现思路
+## v5实现思路
 
-1. 定义交易结构
-2. 创建CoinBase（激励机制）
-3. 代码重构
-4. 查询指定地址余额
-5. 转账实现
-6. 命令模式更新
+1. 实现密钥对
+2. 使用地址，公私钥改写代码
+3. 交易签名
+4. 交易校验
 
-## 辅助：WIN10下如何执行sh脚本
+## 签名校验图示
 
-[参考链接](https://blog.csdn.net/qq_41895190/article/details/82770309)
+![img](imgs_V5/sign.jpg)
+
+比特币使用ECC（椭圆曲线）算法生成非对称加密对。
+
+RSA-->比较常用的非对称加密算法
+
+ECC-->比特币使用非对称加密算法
+
+1. 非对称加密算法有RSA、ECDSA，对极大整数做因数分解的难度决定了RSA算法的可靠性，
+2. ECDSA为椭圆曲线加密算法，是基于椭圆方程公式，所以安全性要高于RSA。
+3. golang封装的`ecdsa`目前只有用私钥加密，公钥做校验，没有解密环节；所以目前可以应用于数字签名；
+
+## 需要签名的内容
+
+### - 签名需要什么？
+
+- 想要签名的数据
+- 私钥
+
+### - 验证需要什么？
+
+- 想要签名的数据
+- 数字签名
+- 公钥
+
+## 公私钥关系以及如何生成地址
+
+![privatepublic](imgs_v5/privatepublic.jpg)
+
+![address](imgs_v5/address.jpg)
 
 ## 具体实现
 
-### v4最终目录结构
+### 创建地址
 
-![directory](imgs_v4/directory_v4.png)
+#### 定义Wallet结构wallet.go
 
-### 交易结构相关transaction.go
+```go
+//这里的钱包是一个结构，每一个钱包保存了公钥私钥对
+type Wallet struct {
+	Private *ecdsa.PrivateKey
+	//PubKey *ecdsa.PublicKey
+	//这里的PubKey不存储原始的公钥，而是存储X，Y拼接的字符串，在校验端重新拆分（参考r，s传递）
+	PubKey []byte
+}
+```
 
-#### 定义交易输入
+由于我们不想在交易中传递公钥本身，想传递[]byte，所以我们将公钥拆分成两个[]byte变量。
+
+将他们append成一个[]byte后存放在公钥字段。
+
+在verify之前一直把这个拼接的byte数组当成公钥。
+
+在verifty时将它再拆成X, Y 两个big.Int 类型的数据，然后拼装成真实的公钥
+
+#### 创建钱包wallet.go
+
+```go
+//创建钱包
+func NewWallet() *Wallet {
+	curve := elliptic.P256()
+	//生成私钥
+	privateKey, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		log.Panic()
+	}
+	//生成公钥
+	pubKeyOrigin := privateKey.PublicKey
+	pubKey := append(pubKeyOrigin.X.Bytes(), pubKeyOrigin.Y.Bytes()...)
+	return &Wallet{
+		Private: privateKey,
+		PubKey:  pubKey,
+	}
+}
+```
+
+#### 地址生成
+
+- 通过公钥生成地址
+- 对公钥进行哈希处理: RIPEMD160(sha256())
+- 获取校验码: checksum()
+- 拼接: version + hash + checksum
+- 对公钥哈希做base58处理
+
+```go
+func HashPubKey(data []byte) []byte {
+	hash := sha256.Sum256(data)
+	rip160hasher := ripemd160.New()
+	_, err := rip160hasher.Write(hash[:])
+	if err != nil {
+		log.Panic()
+	}
+	//返回rip160的hash结果
+	rip160HashValue := rip160hasher.Sum(nil)
+	return rip160HashValue
+}
+
+func CheckSum(data []byte) []byte {
+	//两次sha256
+	hash1 := sha256.Sum256(data)
+	hash2 := sha256.Sum256(hash1[:])
+	//前4字节校验码
+	checkCode := hash2[:4]
+
+	return checkCode
+}
+//生成地址
+func (w *Wallet) NewAddress() string {
+	pubKey := w.PubKey
+	rip160HashValue := HashPubKey(pubKey)
+	version := byte(00)
+	//拼接version
+	payload := append([]byte{version}, rip160HashValue...)
+	//checksum
+	checkCode := CheckSum(payload)
+	//25字节数据
+	payload = append(payload, checkCode...)
+	//base58生成地址
+	address := base58.Encode(payload)
+	return address
+}
+```
+
+### 持久化私钥对，保存到wallet.dat中
+
+#### 定义钱包容器结构体wallets.go
+
+```go
+//定义一个Wallets结构，保存所有的wallet以及它的地址
+type Wallets struct {
+	WalletsMap map[string]*Wallet
+}
+```
+
+#### 新建钱包容器方法wallets.go
+
+```go
+//创建方法
+func NewWallets() *Wallets {
+	var ws Wallets
+	ws.WalletsMap = make(map[string]*Wallet)
+	ws.LoadFile()
+	return &ws
+}
+```
+
+#### 存储到本地wallets.go
+
+```go
+//保存方法，把新建的wallet添加进去
+func (ws *Wallets) SaveToFile() {
+	var buffer bytes.Buffer
+	gob.Register(elliptic.P256())
+	encode := gob.NewEncoder(&buffer)
+	err := encode.Encode(ws)
+	if err != nil {
+		log.Panic(err)
+	}
+	ioutil.WriteFile(walletFile, buffer.Bytes(), 0600)
+}
+```
+
+#### 读取持久化的钱包文件方法wallets.go
+
+```go
+//读取文件方法，把所有的wallet读出来
+func (ws *Wallets) LoadFile() {
+	//读取之前确认文件是否存在
+	_, err := os.Stat(walletFile)
+	if os.IsNotExist(err) {
+		//ws.WalletsMap = make(map[string]*Wallet)
+		return
+	}
+	content, err := ioutil.ReadFile(walletFile)
+	if err != nil {
+		log.Panic(err)
+	}
+	gob.Register(elliptic.P256())
+	//解码
+	decoder := gob.NewDecoder(bytes.NewReader(content))
+	var wsLocal Wallets
+	err = decoder.Decode(&wsLocal)
+	if err != nil {
+		log.Panic(err)
+	}
+	ws.WalletsMap = wsLocal.WalletsMap
+}
+```
+
+
+
+#### 新建钱包wallets.go
+
+```go
+func (ws *Wallets) CreateWallet() string {
+	wallet := NewWallet()
+	address := wallet.NewAddress()
+	//wallets.WalletsMap = make(map[string]*Wallet)
+	ws.WalletsMap[address] = wallet
+	ws.SaveToFile()
+	return address
+}
+```
+
+#### 获取所有地址wallets.go
+
+```go
+func (ws *Wallets) ListAllAddresses() []string {
+	var addresses []string
+	for address := range ws.WalletsMap {
+		addresses = append(addresses, address)
+	}
+	return addresses
+}
+```
+
+### 修改交易结构transaction.go
+
+#### 修改交易输入
 
 ```go
 //定义交易输入
 type TXInput struct {
 	//引用的交易ID
 	TXid []byte
-	//引用的output的索引值
+	//引用的output的索引
 	Index int64
-	//解锁脚本，我们用地址来模拟
-	Sig string
+	//解锁脚本,我们用地址来模拟
+	//Sig string
+	//真正的数字签名，由r，s拼接成的字节数组
+	Signature []byte
+	//这里的PubKey不存储原始的公钥，而是存储X，Y拼接的字符串，在校验端重新拆分（参考r，s传递）
+	PubKey []byte
 }
 ```
 
-#### 定义交易输出
+#### 修改交易输出
 
 ```go
 //定义交易输出
 type TXOutput struct {
 	//转账金额
 	Value float64
-	//锁定脚本,我们用地址模拟
-	PubKeyHash string
+	//锁定脚本，我们用地址模拟
+	//PubKeyHash string
+	//收款方的公钥的hash
+	PubKeyHash []byte
 }
 ```
 
-#### 定义交易结构
+### 锁定脚本实现
+
+#### 通过地址返回公钥hash wallets.go
 
 ```go
-//1. 定义交易结构
-type Transaction struct {
-	TXID      []byte     //交易ID
-	TXInputs  []TXInput  //交易输入数组
-	TXOutputs []TXOutput //交易输出的数组
+//通过地址返回公钥哈希
+func GetPubKeyHashFromAddress(address string) []byte {
+	//1.解码
+	addressByte := base58.Decode(address) //25字节
+	//2.截取出公钥hash，去除version--1字节，去除校验码--4字节
+	pubKeyHash := addressByte[1 : len(addressByte)-4]
+	return pubKeyHash
 }
 ```
 
-#### 设置交易ID，为hash值
+#### 锁定脚本transaction.go
 
 ```go
-//设置交易ID
-func (tx *Transaction) SetHash() {
-	var buffer bytes.Buffer
+//由于现在存储的字段是地址的公钥hash，所以无法直接创建TXoutput
+//为了能够得到公钥hash，我们需要处理一下，写一个Lock函数
+func (output *TXOutput) Lock(address string) {
+	pubKeyHash := GetPubKeyHashFromAddress(address)
+	//真正的锁定动作
+	output.PubKeyHash = pubKeyHash
+}
+```
 
-	encoder := gob.NewEncoder(&buffer)
+### 创建TXOutput transaction.go
 
-	err := encoder.Encode(tx)
-	if err != nil {
-		log.Panic(err)
+```go
+//给TXOutput提供一个创建的方法，否则无法调用Lock
+func NewTXOutput(value float64, address string) *TXOutput {
+	output := TXOutput{
+		Value: value,
 	}
-
-	data := buffer.Bytes()
-	hash := sha256.Sum256(data)
-	tx.TXID = hash[:]
+	output.Lock(address)
+	return &output
 }
 ```
 
-### Coinbase交易方法实现（激励机制）transaction.go
+### 重构对应代码
 
-设置挖矿奖励金额:
-
-```go
-const reward = 50
-```
+#### 更新NewCoinbaseTX transaction.go
 
 ```go
-//2. 提供创建交易方法(挖矿交易)
-func NewCoinbaseTX(address string, data string) *Transaction {
-	//挖矿交易的特点：
-	//1. 只有一个input
-	//2. 无需引用交易id
-	//3. 无需引用index
-	//矿工由于挖矿时无需指定签名，所以这个sig字段可以由矿工自由填写数据，一般是填写矿池的名字
-	input := TXInput{[]byte{}, -1, data}
-	output := TXOutput{reward, address}
-
-	//对于挖矿交易来说，只有一个input和一output
-	tx := Transaction{[]byte{}, []TXInput{input}, []TXOutput{output}}
-	tx.SetHash()
-
-	return &tx
-}
-```
-
-### 判断一个交易是否是Coinbase交易方法的实现transaction.go
-
-```go
-//实现一个函数，判断当前的交易是否为挖矿交易
-func (tx *Transaction) IsCoinbase() bool {
-	//1. 交易input只有一个
-	//if len(tx.TXInputs) == 1  {
-	//	input := tx.TXInputs[0]
-	//	//2. 交易id为空
-	//	//3. 交易的index 为 -1
-	//	if !bytes.Equal(input.TXid, []byte{}) || input.Index != -1 {
-	//		return false
-	//	}
-	//}
-	//return true
-
-	if len(tx.TXInputs) == 1 && len(tx.TXInputs[0].TXid) == 0 && tx.TXInputs[0].Index == -1 {
-		return true
-	}
-
-	return false
-}
-```
-
-
-
-### MerkelRoot生成方法block.go
-
-```go
-//模拟梅克尔根，只是对交易的数据做简单的拼接，而不做二叉树处理！
-func (block *Block) MakeMerkelRoot() []byte {
-	var info []byte
-	//var finalInfo [][]byte
-	for _, tx := range block.Transactions {
-		//将交易的哈希值拼接起来，再整体做哈希处理
-		info = append(info, tx.TXID...)
-		//finalInfo = [][]byte{tx.TXID}
-	}
-
-	hash := sha256.Sum256(info)
-	return hash[:]
-}
-```
-
-
-
-### 重构代码
-
-#### 重构Block结构体block.go
-
-```go
-//0. 定义结构
-type Block struct {
-	//1.版本号
-	Version uint64
-	//2. 前区块哈希
-	PrevHash []byte
-	//3. Merkel根（梅克尔根，这就是一个哈希值，我们先不管，我们后面v4再介绍）
-	MerkelRoot []byte
-	//4. 时间戳
-	TimeStamp uint64
-	//5. 难度值
-	Difficulty uint64
-	//6. 随机数，也就是挖矿要找的数据
-	Nonce uint64
-
-	//a. 当前区块哈希,正常比特币区块中没有当前区块的哈希，我们为了是方便做了简化！
-	Hash []byte
-	//b. 数据
-	//Data []byte
-	//真实的交易数组
-	Transactions []*Transaction
-}
-```
-
-#### 重构NewBlock方法block.go
-
-```go
-//2. 创建区块
-func NewBlock(txs []*Transaction, prevBlockHash []byte) *Block {
-	block := Block{
-		Version:    00,
-		PrevHash:   prevBlockHash,
-		MerkelRoot: []byte{},
-		TimeStamp:  uint64(time.Now().Unix()),
-		Difficulty: 0, //随便填写的无效值
-		Nonce:      0, //同上
-		Hash:       []byte{},
-		//Data:       []byte(data),
-		Transactions: txs,
-	}
-
-	block.MerkelRoot = block.MakeMerkelRoot()
-
-	//block.SetHash()
-	//创建一个pow对象
-	pow := NewProofOfWork(&block)
-	//查找随机数，不停的进行哈希运算
-	hash, nonce := pow.Run()
-
-	//根据挖矿结果对区块数据进行更新（补充）
-	block.Hash = hash
-	block.Nonce = nonce
-
-	return &block
-}
-```
-
-#### 重构NewBlockChain方法blockchain.go
-
-删掉以往的CreateBlockChain方法
-
-```go
-//5. 定义一个区块链
-func NewBlockChain(address string) *BlockChain {
-	//return &BlockChain{
-	//	blocks: []*Block{genesisBlock},
-	//}
-
-	//最后一个区块的哈希， 从数据库中读出来的
-	var lastHash []byte
-
-	//1. 打开数据库
-	db, err := bolt.Open(blockChainDb, 0600, nil)
-	//defer db.Close()
-
-	if err != nil {
-		log.Panic("打开数据库失败！")
-	}
-
-	//将要操作数据库（改写）
-	db.Update(func(tx *bolt.Tx) error {
-		//2. 找到抽屉bucket(如果没有，就创建）
-		bucket := tx.Bucket([]byte(blockBucket))
-		if bucket == nil {
-			//没有抽屉，我们需要创建
-			bucket, err = tx.CreateBucket([]byte(blockBucket))
-			if err != nil {
-				log.Panic("创建bucket(b1)失败")
-			}
-
-			//创建一个创世块，并作为第一个区块添加到区块链中
-			genesisBlock := GenesisBlock(address)
-			//fmt.Printf("genesisBlock :%s\n", genesisBlock)
-
-			//3. 写数据
-			//hash作为key， block的字节流作为value，尚未实现
-			bucket.Put(genesisBlock.Hash, genesisBlock.Serialize())
-			bucket.Put([]byte("LastHashKey"), genesisBlock.Hash)
-			lastHash = genesisBlock.Hash
-
-			////这是为了读数据测试，马上删掉,套路!
-			//blockBytes := bucket.Get(genesisBlock.Hash)
-			//block := Deserialize(blockBytes)
-			//fmt.Printf("block info : %s\n", block)
-
-		} else {
-			lastHash = bucket.Get([]byte("LastHashKey"))
-		}
-
-		return nil
-	})
-
-	return &BlockChain{db, lastHash}
-}
-```
-
-#### 重构AddBlock方法blockchain.go
-
-```go
-//5. 添加区块
-func (bc *BlockChain) AddBlock(txs []*Transaction) {
-	//如何获取前区块的哈希呢？？
-	db := bc.db         //区块链数据库
-	lastHash := bc.tail //最后一个区块的哈希
-
-	db.Update(func(tx *bolt.Tx) error {
-
-		//完成数据添加
-		bucket := tx.Bucket([]byte(blockBucket))
-		if bucket == nil {
-			log.Panic("bucket 不应该为空，请检查!")
-		}
-
-		//a. 创建新的区块
-		block := NewBlock(txs, lastHash)
-
-		//b. 添加到区块链db中
-		//hash作为key， block的字节流作为value，尚未实现
-		bucket.Put(block.Hash, block.Serialize())
-		bucket.Put([]byte("LastHashKey"), block.Hash)
-
-		//c. 更新一下内存中的区块链，指的是把最后的小尾巴tail更新一下
-		bc.tail = block.Hash
-
-		return nil
-	})
-}
-```
-
-### ***交易真正的实现blockchain.go
-
-![scripts](imgs_v4/scripts.jpg)
-
-#### 找到指定地址的UTXO的交易集合
-
-我们的比特币都在UTXO中，UTXO又包含在交易中，所以如果想知道我们可以支配的UTXO，必须找到这些UTXO所在的交易，每个人有N个UTXO，所以我们需要找到所有的交易，也就是说，应该找到包含UTXO的交易的集合。
-
-##### 找到指定地址的UTXO的交易的集合
-
-```go
-func (bc *BlockChain) FindUTXOTransactions(address string) []*Transaction {
-	var txs []*Transaction //存储所有包含utxo交易集合
-	//我们定义一个map来保存消费过的output，key是这个output的交易id，value是这个交易中索引的数组
-	//map[交易id][]int64
-	spentOutputs := make(map[string][]int64)
-
-	//创建迭代器
-	it := bc.NewIterator()
-
-	for {
-		//1.遍历区块
-		block := it.Next()
-
-		//2. 遍历交易
-		for _, tx := range block.Transactions {
-			//fmt.Printf("current txid : %x\n", tx.TXID)
-
-		OUTPUT:
-		//3. 遍历output，找到和自己相关的utxo(在添加output之前检查一下是否已经消耗过)
-		//	i : 0, 1, 2, 3
-			for i, output := range tx.TXOutputs {
-				//fmt.Printf("current index : %d\n", i)
-				//在这里做一个过滤，将所有消耗过的outputs和当前的所即将添加output对比一下
-				//如果相同，则跳过，否则添加
-				//如果当前的交易id存在于我们已经表示的map，那么说明这个交易里面有消耗过的output
-
-				//map[2222] = []int64{0}
-				//map[3333] = []int64{0, 1}
-				//这个交易里面有我们消耗过得output，我们要定位它，然后过滤掉
-				if spentOutputs[string(tx.TXID)] != nil {
-					for _, j := range spentOutputs[string(tx.TXID)] {
-						//[]int64{0, 1} , j : 0, 1
-						if int64(i) == j {
-							//fmt.Printf("111111")
-							//当前准备添加output已经消耗过了，不要再加了
-							continue OUTPUT
-						}
-					}
-				}
-
-				//这个output和我们目标的地址相同，满足条件，加到返回UTXO数组中
-				if output.PubKeyHash == address {
-					//fmt.Printf("222222")
-					//UTXO = append(UTXO, output)
-
-					//!!!!!重点
-					//返回所有包含我的outx的交易的集合
-					txs = append(txs, tx)
-
-					//fmt.Printf("333333 : %f\n", UTXO[0].Value)
-				} else {
-					//fmt.Printf("333333")
-				}
-			}
-
-			//如果当前交易是挖矿交易的话，那么不做遍历，直接跳过
-
-			if !tx.IsCoinbase() {
-				//4. 遍历input，找到自己花费过的utxo的集合(把自己消耗过的标示出来)
-				for _, input := range tx.TXInputs {
-					//判断一下当前这个input和目标（李四）是否一致，如果相同，说明这个是李四消耗过的output,就加进来
-					if input.Sig == address {
-						//spentOutputs := make(map[string][]int64)
-						//indexArray := spentOutputs[string(input.TXid)]
-						//indexArray = append(indexArray, input.Index)
-						spentOutputs[string(input.TXid)] = append(spentOutputs[string(input.TXid)], input.Index)
-						//map[2222] = []int64{0}
-						//map[3333] = []int64{0, 1}
-					}
-				}
-			} else {
-				//fmt.Printf("这是coinbase，不做input遍历！")
-			}
-		}
-
-		if len(block.PrevHash) == 0 {
-			break
-			fmt.Printf("区块遍历完成退出!")
-		}
-	}
-
-	return txs
-}
-```
-
-
-
-```go
-//找到指定地址的所有的utxo
-func (bc *BlockChain) FindUTXOs(address string) []TXOutput {
-	var UTXO []TXOutput
-
-	txs := bc.FindUTXOTransactions(address)
-
-	for _, tx := range txs {
-		for _, output := range tx.TXOutputs {
-			if address == output.PubKeyHash {
-				UTXO = append(UTXO, output)
-			}
-		}
-	}
-
-	return UTXO
-}
-```
-
-#### 找到指定地址所需金额的UTXO的集合，同时将这些UTXO总额一并返回
-
-```go
-//根据需求找到合理的utxo
-func (bc *BlockChain) FindNeedUTXOs(from string, amount float64) (map[string][]uint64, float64) {
-	//找到的合理的utxos集合
-	utxos := make(map[string][]uint64)
-	var calc float64
-
-	txs := bc.FindUTXOTransactions(from)
-
-	for _, tx := range txs {
-		for i, output := range tx.TXOutputs {
-			if from == output.PubKeyHash {
-
-				utxos[string(tx.TXID)] = append(utxos[string(tx.TXID)], uint64(i))
-				calc += output.Value
-
-				if calc >= amount {
-					//break
-					fmt.Printf("找到了满足的金额：%f\n", calc)
-					return utxos, calc
-				}
-			} else {
-				fmt.Printf("不满足转账金额,当前总额：%f， 目标金额: %f\n", calc, amount)
-			}
-		}
-	}
-
-	return utxos, calc
-}
-```
-
-### 创建普通交易的方法实现
-
-```go
+//2.创建交易
 func NewTransaction(from, to string, amount float64, bc *BlockChain) *Transaction {
-
-	//1. 找到最合理UTXO集合 map[string][]uint64
-	utxos, resValue := bc.FindNeedUTXOs(from, amount)
-
+	//1.创建交易之后要进行数字签名，所以需要私钥->打开钱包(NewWallets())
+	ws := NewWallets()
+	//2.根据地址找到自己的wallet
+	wallet := ws.WalletsMap[from]
+	if wallet == nil {
+		fmt.Println("没有找到该地址的钱包，交易创建失败!")
+		return nil
+	}
+	//3.得到对应的公钥私钥
+	pubKey := wallet.PubKey
+	privateKey := wallet.Private
+	//传递公钥的hash
+	pubKeyHash := HashPubKey(pubKey)
+	//1.找到最合理的UTXO集合 map[string]uint64
+	utxos, resValue := bc.FindNeedUTXOS(pubKeyHash, amount)
 	if resValue < amount {
-		fmt.Printf("余额不足，交易失败!")
+		fmt.Println("余额不足，交易失败")
 		return nil
 	}
 
 	var inputs []TXInput
 	var outputs []TXOutput
-
-	//2. 创建交易输入, 将这些UTXO逐一转成inputs
-	//map[2222] = []int64{0}
-	//map[3333] = []int64{0, 1}
+	//2.将这些UTXO逐一转成inputs
 	for id, indexArray := range utxos {
 		for _, i := range indexArray {
-			input := TXInput{[]byte(id), int64(i), from}
+			input := TXInput{[]byte(id), int64(i), nil, pubKey}
 			inputs = append(inputs, input)
 		}
 	}
-
-	//创建交易输出
-	output := TXOutput{amount, to}
-	outputs = append(outputs, output)
-
-	//找零
+	//3.创建outputs
+	//output := TXOutput{amount, to}
+	output := NewTXOutput(amount, to)
+	outputs = append(outputs, *output)
+	//4.如果有零钱需要找零
 	if resValue > amount {
-		outputs = append(outputs, TXOutput{resValue - amount, from})
+		output = NewTXOutput(resValue-amount, from)
+		outputs = append(outputs, *output)
 	}
 
 	tx := Transaction{[]byte{}, inputs, outputs}
 	tx.SetHash()
+
+	bc.SignTransaction(&tx, privateKey)
 	return &tx
 }
 ```
 
-### 命令行代码重构
-
-#### cli.go
+#### 更新NewTransaction transaction.go
 
 ```go
-//这是一个用来接收命令行参数并且控制区块链操作的文件
+//2.创建交易
+func NewTransaction(from, to string, amount float64, bc *BlockChain) *Transaction {
+	//1.创建交易之后要进行数字签名，所以需要私钥->打开钱包(NewWallets())
+	ws := NewWallets()
+	//2.根据地址找到自己的wallet
+	wallet := ws.WalletsMap[from]
+	if wallet == nil {
+		fmt.Println("没有找到该地址的钱包，交易创建失败!")
+		return nil
+	}
+	//3.得到对应的公钥私钥
+	pubKey := wallet.PubKey
+	privateKey := wallet.Private
+	//传递公钥的hash
+	pubKeyHash := HashPubKey(pubKey)
+	//1.找到最合理的UTXO集合 map[string]uint64
+	utxos, resValue := bc.FindNeedUTXOS(pubKeyHash, amount)
+	if resValue < amount {
+		fmt.Println("余额不足，交易失败")
+		return nil
+	}
 
-type CLI struct {
-	bc *BlockChain
+	var inputs []TXInput
+	var outputs []TXOutput
+	//2.将这些UTXO逐一转成inputs
+	for id, indexArray := range utxos {
+		for _, i := range indexArray {
+			input := TXInput{[]byte(id), int64(i), nil, pubKey}
+			inputs = append(inputs, input)
+		}
+	}
+	//3.创建outputs
+	//output := TXOutput{amount, to}
+	output := NewTXOutput(amount, to)
+	outputs = append(outputs, *output)
+	//4.如果有零钱需要找零
+	if resValue > amount {
+		output = NewTXOutput(resValue-amount, from)
+		outputs = append(outputs, *output)
+	}
+
+	tx := Transaction{[]byte{}, inputs, outputs}
+	tx.SetHash()
+
+	bc.SignTransaction(&tx, privateKey)
+	return &tx
 }
+```
 
-const Usage = `
-	printChain               "正向打印区块链"
-	printChainR              "反向打印区块链"
-	getBalance --address ADDRESS "获取指定地址的余额"
-	send FROM TO AMOUNT MINER DATA "由FROM转AMOUNT给TO，由MINER挖矿，同时写入DATA"
-`
+### 检验地址有效性wallet.go
 
-//接受参数的动作，我们放到一个函数中
+```go
+func IsValidAddress(address string) bool {
+	//1.解码
+	addressByte := base58.Decode(address)
+	if len(addressByte) < 4 {
+		return false
+	}
+	//2.截取数据
+	payload := addressByte[:len(addressByte)-4]
+	checkSum1 := addressByte[len(addressByte)-4:]
+	//3.做checkSum函数
+	checkSum2 := CheckSum(payload)
+	//4.比较
+	return bytes.Equal(checkSum1, checkSum2)
+}
+```
 
-func (cli *CLI) Run() {
+### 数字签名
 
-	//./block printChain
-	//./block addBlock --data "HelloWorld"
-	//1. 得到所有的命令
-	args := os.Args
-	if len(args) < 2 {
-		fmt.Printf(Usage)
+![sign2](imgs_v5/sign2.jpg)
+
+#### 签哪些数据？
+
+**所谓对交易签名**，就是对交易的哈希值签名，但是这个交易中要包含以下数据（注意，是包含以下内容，而不是仅限于以下信息）：
+
+- 欲使用utxo中的pubKeyHash（这描述了付款人）
+- 新生成utxo中的pubKeyHash（这描述了收款人）
+- 转账金额
+
+最后，把签好的数据放在每一个input的sig中
+
+==由于每一笔交易都可能引用多个utxo（存在于多条交易中），所以我们要遍历所有的引用交易，并对它们逐个签名。==
+
+查看浏览器交易签名
+
+#### 在交易中签名
+
+交易创建完成之后，在写入区块之前，我们要对其进行签名，这样对端才能够校验，从而保证系统的安全性。
+
+为此我们需要在Transaction中添加签名(sign)和验证(verify)的方法。
+
+#### Sign
+
+==先把空函数写出来，Sign和SignTransaction，把关系交代清楚之后再进行内部实现==
+
+签名需要下面两个数据：
+
+- 想要签名的数据
+- 私钥
+
+==无论是签名还是校验，一定要格外注意处理挖矿交易==
+
+##### transaction.go
+
+```go
+//签名的具体实现,参数为：私钥，inputs里面所有引用的交易的结构map[string]Transaction
+//map[A] TransactionA
+func (tx *Transaction) Sign(privateKey *ecdsa.PrivateKey, prevTXs map[string]Transaction) {
+	//对coinbase交易不签名
+	if tx.IsCoinbase() {
 		return
 	}
-
-	//2. 分析命令
-	cmd := args[1]
-	switch cmd {
-	case "printChain":
-		fmt.Printf("正向打印区块\n")
-		cli.PrinBlockChain()
-	case "printChainR":
-		fmt.Printf("反向打印区块\n")
-		cli.PrinBlockChainReverse()
-	case "getBalance":
-		fmt.Printf("获取余额\n")
-		if len(args) == 4 && args[2] == "--address" {
-			address := args[3]
-			cli.GetBalance(address)
+	//1.创建一个当期交易的副本:txCopy，使用函数:TrimmedCopy：要把Signature和PubKey字段设置为nil
+	txCopy := tx.TrimmedCopy()
+	//2.循环遍历txCopy的inputs，得到input所引用的output的公钥哈希
+	for i, input := range txCopy.TXInputs {
+		prevTX := prevTXs[string(input.TXid)]
+		if len(prevTX.TXID) == 0 {
+			log.Panic("引用的交易无效")
 		}
-	case "send":
-		fmt.Printf("转账开始...\n")
-		if len(args) != 7 {
-			fmt.Printf("参数个数错误，请检查！\n")
-			fmt.Printf(Usage)
-			return
+		//不要对input进行赋值，这是一个副本，要对txCopy.TXInputs[i]进行操作
+		txCopy.TXInputs[i].PubKey = prevTX.TXOutputs[input.Index].PubKeyHash
+		//所需要的三个数据都具备了，开始做哈希处理
+		//3.生成要签名的数据，要签名的数据一定是哈希值
+		txCopy.SetHash()
+		//还原，以免影响后面input的签名
+		//a.我们对每一个input都要签名一次，签名数据是由当前input引用的output的哈希+当前的outputs（都在当前tx的副本里）
+		//b.要对拼好的txCopy进行哈希处理，SetHash得到TXID，这个TXID就是我们要签名的最终数据
+		txCopy.TXInputs[i].PubKey = nil
+		signDataHash := txCopy.TXID
+		//4.进行签名动作
+		r, s, err := ecdsa.Sign(rand.Reader, privateKey, signDataHash)
+		if err != nil {
+			log.Panic(err)
 		}
-		//./block send FROM TO AMOUNT MINER DATA "由FROM转AMOUNT给TO，由MINER挖矿，同时写入DATA"
-		from := args[2]
-		to := args[3]
-		amount, _ := strconv.ParseFloat(args[4], 64) //知识点，请注意
-		miner := args[5]
-		data := args[6]
-		cli.Send(from, to, amount, miner, data)
-	default:
-		fmt.Printf("无效的命令，请检查!\n")
-		fmt.Printf(Usage)
+		signature := append(r.Bytes(), s.Bytes()...)
+		//5.放到我们的input的Signature中
+		txCopy.TXInputs[i].Signature = signature
 	}
+
 }
 
+func (tx *Transaction) TrimmedCopy() Transaction {
+	var inputs []TXInput
+	var outputs []TXOutput
+	for _, input := range tx.TXInputs {
+		inputs = append(inputs, TXInput{input.TXid, input.Index, nil, nil})
+	}
+
+	for _, output := range tx.TXOutputs {
+		outputs = append(outputs, output)
+	}
+	return Transaction{tx.TXID, inputs, outputs}
+}
 ```
 
-#### commandLine.go
+##### 根据交易id查找交易blockchain.go
 
 ```go
-//正向打印
-func (cli *CLI) PrinBlockChain() {
-	cli.bc.Printchain()
-	fmt.Printf("打印区块链完成\n")
+//根据id查找交易本身，需要遍历区块链
+func (bc *BlockChain) FindTransactionByTXid(id []byte) (Transaction, error) {
+   //1.遍历区块链
+   it := bc.NewIterator()
+   for {
+      block := it.Next()
+      //2.遍历交易
+      for _, tx := range block.Transactions {
+         //3.比较交易，找到了直接退出
+         if bytes.Equal(tx.TXID, id) {
+            return *tx, nil
+         }
+      }
+
+      if len(block.PrevHash) == 0 {
+         fmt.Printf("区块链遍历结束!\n")
+         break
+      }
+   }
+   //4.如果没找到，返回空Transaction同时返回错误状态
+   return Transaction{}, errors.New("无效的交易id，请检查!")
 }
+```
 
-//反向打印
-func (cli *CLI) PrinBlockChainReverse() {
-	bc := cli.bc
-	//创建迭代器
-	it := bc.NewIterator()
 
-	//调用迭代器，返回我们的每一个区块数据
-	for {
-		//返回区块，左移
-		block := it.Next()
 
-		fmt.Printf("===========================\n\n")
-		fmt.Printf("版本号: %d\n", block.Version)
-		fmt.Printf("前区块哈希值: %x\n", block.PrevHash)
-		fmt.Printf("梅克尔根: %x\n", block.MerkelRoot)
-		timeFormat := time.Unix(int64(block.TimeStamp), 0).Format("2006-01-02 15:04:05")
-		fmt.Printf("时间戳: %s\n", timeFormat)
-		fmt.Printf("难度值(随便写的）: %d\n", block.Difficulty)
-		fmt.Printf("随机数 : %d\n", block.Nonce)
-		fmt.Printf("当前区块哈希值: %x\n", block.Hash)
-		fmt.Printf("区块数据 :%s\n", block.Transactions[0].TXInputs[0].Sig)
+##### 对交易进行签名blockchain.go
 
-		if len(block.PrevHash) == 0 {
-			fmt.Printf("区块链遍历结束！")
-			break
+```go
+
+func (bc *BlockChain) SignTransaction(tx *Transaction, privateKey *ecdsa.PrivateKey) {
+	//签名，交易创建的最后进行签名
+	prevTXs := make(map[string]Transaction)
+
+	//找到所有引用的交易
+	//1.根据inputs来找，有多少个input就遍历多少次
+	//2.找到目标的交易，根据TXID来找
+	//3.添加到prevTXs
+	for _, input := range tx.TXInputs {
+		//根据id查找交易本身，我们需要遍历整个区块链
+		tx, err := bc.FindTransactionByTXid(input.TXid)
+		if err != nil {
+			log.Panic(err)
+		}
+
+		prevTXs[string(input.TXid)] = tx
+	}
+
+	tx.Sign(privateKey, prevTXs)
+}
+```
+
+### 在挖矿时校验
+
+当一笔交易发送到对端时，接收方在打包到自己的区块前，需要先对交易进行校验，从而保证
+
+1. 持有者花费的确实是自己的钱
+2. 交易确实是由私钥的持有者发起的
+
+### - 分析
+
+校验函数(Verify)依然在Transaction结构中实现，需要三个数据：
+
+- 想要签名的数据
+- 数字签名
+- 公钥
+
+代码如下：
+
+校验函数原型如下，由于交易中已经存储了`数字签名`和`公钥`，所以只需要将引用的交易传递进来即可（为了获取引用输出的公钥哈希）
+
+##### 验证单笔交易blockchain.go
+
+```go
+func (bc *BlockChain) VerifyTransaction(tx *Transaction) bool {
+	if tx.IsCoinbase() {
+		return true
+	}
+	//签名，交易创建的最后进行签名
+	prevTXs := make(map[string]Transaction)
+
+	//找到所有引用的交易
+	//1.根据inputs来找，有多少个input就遍历多少次
+	//2.找到目标的交易，根据TXID来找
+	//3.添加到prevTXs
+	for _, input := range tx.TXInputs {
+		//根据id查找交易本身，我们需要遍历整个区块链
+		tx, err := bc.FindTransactionByTXid(input.TXid)
+		if err != nil {
+			log.Panic(err)
+		}
+
+		prevTXs[string(input.TXid)] = tx
+	}
+	return tx.Verify(prevTXs)
+}
+```
+
+##### 校验过程的实现transaction.go
+
+```go
+//分析校验过程
+//所需要的数据：公钥、数据（txCopy、生成哈希）签名
+//我们要对每一个签名过得input进行校验
+func (tx *Transaction) Verify(prevTXs map[string]Transaction) bool {
+	if tx.IsCoinbase() {
+		return true
+	}
+
+	//1.得到签名数据
+	txCopy := tx.TrimmedCopy()
+	for i, input := range tx.TXInputs {
+		prevTX := prevTXs[string(input.TXid)]
+		if len(prevTX.TXID) == 0 {
+			log.Panic("引用的交易无效")
+		}
+		txCopy.TXInputs[i].PubKey = prevTX.TXOutputs[input.Index].PubKeyHash
+		txCopy.SetHash()
+		dataHash := txCopy.TXID
+		//2.得到Signature,反推r，s
+		signature := input.Signature //r,s
+		pubKey := input.PubKey       //拆x,y
+		r := big.Int{}
+		s := big.Int{}
+
+		r.SetBytes(signature[:len(signature)/2])
+		s.SetBytes(signature[len(signature)/2:])
+
+		//3.拆解PubKey，得到x，y
+		X := big.Int{}
+		Y := big.Int{}
+
+		X.SetBytes(pubKey[:len(pubKey)/2])
+		Y.SetBytes(pubKey[len(pubKey)/2:])
+		pubKeyOrigin := ecdsa.PublicKey{elliptic.P256(), &X, &Y}
+		//4.Verify
+		if !ecdsa.Verify(&pubKeyOrigin, dataHash, &r, &s) {
+			return false
 		}
 	}
-}
-
-func (cli *CLI) GetBalance(address string) {
-
-	utxos := cli.bc.FindUTXOs(address)
-
-	total := 0.0
-	for _, utxo := range utxos {
-		total += utxo.Value
-	}
-
-	fmt.Printf("\"%s\"的余额为：%f\n", address, total)
-}
-
-func (cli *CLI) Send(from, to string, amount float64, miner, data string) {
-	//fmt.Printf("from : %s\n", from)
-	//fmt.Printf("to : %s\n", to)
-	//fmt.Printf("amount : %f\n", amount)
-	//fmt.Printf("miner : %s\n", miner)
-	//fmt.Printf("data : %s\n", data)
-
-	//1. 创建挖矿交易
-	coinbase := NewCoinbaseTX(miner, data)
-
-	txs := []*Transaction{coinbase}
-
-	//2. 创建一个普通交易
-	tx := NewTransaction(from, to, amount, cli.bc)
-	if tx != nil {
-		txs = append(txs, tx)
-	} else {
-		fmt.Printf("发现无效的交易!\n")
-	}
-
-	//3. 添加到区块
-	cli.bc.AddBlock(txs)
-	fmt.Printf("转账成功！")
+	return true
 }
 
 ```
 
-## v4版本完成，进行测试main.go
+#### 更新AddBlock方法
 
-```shell
+```go
+//6.添加区块
+func (bc *BlockChain) AddBlock(txs []*Transaction) {
+	for _, tx := range txs {
+		if !bc.VerifyTransaction(tx) {
+			fmt.Printf("矿工发现无效交易\n")
+			return
+		}
+	}
+
+	//区块链数据库
+	db := bc.db
+	//最后一个区块的hash
+	lastHash := bc.tail
+	db.Update(func(tx *bolt.Tx) error {
+		//完成数据添加
+		bucket := tx.Bucket([]byte(blockBucket))
+		if bucket == nil {
+			log.Panic("bucket不应该为空，请检查")
+		}
+
+		block := NewBlock(txs, lastHash)
+		//更新区块链数据库--写区块
+		bucket.Put(block.Hash, block.Serialize())
+		bucket.Put([]byte(blockLastHashKey), block.Hash)
+		//更新内存中的区块链
+		bc.tail = block.Hash
+		return nil
+	})
+}
+```
+
+## v5完成，进行测试main.go
+
+```go
 func main() {
-	bc := NewBlockChain("sher")
+	bc := NewBlockChain("18fh8wzXAzP9kE433CwNCQ34e4rjeDZgZN")
 	cli := CLI{bc}
 	cli.Run()
+	//bc.AddBlock("第二个区块")
+	//bc.AddBlock("第三个区块")
+
+	//调用迭代器，返回每一个区块数据
+	//it := bc.NewIterator()
+	//for {
+	//	//返回区块，左移
+	//	block := it.Next()
+	//	fmt.Println("===================================")
+	//	fmt.Printf("前区块的hash值： %x\n", block.PrevHash)
+	//	fmt.Printf("当前区块的hash值： %x\n", block.Hash)
+	//	fmt.Printf("区块数据:  %s\n", block.Data)
+	//
+	//	if len(block.PrevHash) == 0 {
+	//		fmt.Printf("区块遍历结束")
+	//		break
+	//	}
+	//}
+	bc.db.Close()
 }
+
 ```
 
-#### 先不带参数运行一次创建区块链
+### 先不带参数运行go build .
 
 ```shell
-开始挖矿...
-挖矿成功！hash : 00000f82ba116f07985e568eb39928096b003eb85bf29aea906689a367a83f48, nonce : 134340
+开始挖矿......
+挖矿成功!hash: 00000df4b1e20a3358ef6e9f3b9f0ce059b877f478f700960f3ec5ad7a347310 ,nonce: 1663493
 ```
 
-#### 查询余额
+### 新建钱包
 
 ```shell
-getBalance --address sher
+newWallet
 
+创建新的钱包....
+地址: 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx
+```
+
+### 查看所有地址
+
+```shell
+listAddresses
+
+列举所有地址...
+地址: 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx
+```
+
+### 获取余额
+
+```shell
+getBalance --address 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx
 获取余额
-"sher"的余额为：50.000000
-```
+这是Coinbase 不做input遍历
+区块遍历完成退出
+"17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx"的余额为: 0.000000
 
-#### 转账测试
-
-```shell
-send sher lin 5 sher "MyCoinbase"
-
-转账开始...
-找到了满足的金额：50.000000
-开始挖矿...
-挖矿成功！hash : 00000be134f3421ba301000686b388dce3e8704c9a4e88804e1254b17f62f62f, nonce : 443064
-转账成功！
-```
-
-#### 查询lin和sher这两个账户的余额
-
-```shell
-getBalance --address sher
+getBalance --address 18fh8wzXAzP9kE433CwNCQ34e4rjeDZgZN
 获取余额
-"sher"的余额为：95.000000
-
-getBalance --address lin
-获取余额
-"lin"的余额为：5.000000
+这是Coinbase 不做input遍历
+区块遍历完成退出
+"18fh8wzXAzP9kE433CwNCQ34e4rjeDZgZN"的余额为: 12.500000
 ```
 
-#### 打印区块链
+### 转账
 
 ```shell
-printChain
+send 18fh8wzXAzP9kE433CwNCQ34e4rjeDZgZN 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx 1.2 18fh8wzXAzP9kE433CwNCQ34e4rjeDZgZN "MyBlockChain"
 
-正向打印区块
-=============== 区块高度: 0 ==============
+转账开始
+没有找到该地址的钱包，交易创建失败!
+无效的交易
+
+newWallet
+创建新的钱包....
+地址: 12EnGYQdSB8g5gcKcchWfAj9MQq11EZiDL
+
+listAddresses
+列举所有地址...
+地址: 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx
+地址: 12EnGYQdSB8g5gcKcchWfAj9MQq11EZiDL
+
+send 12EnGYQdSB8g5gcKcchWfAj9MQq11EZiDL 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx 1 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx "MyBlockChain"
+转账开始
+这是Coinbase 不做input遍历
+区块遍历完成退出
+余额不足，交易失败
+无效的交易
+
+send 12EnGYQdSB8g5gcKcchWfAj9MQq11EZiDL 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx 0 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx "MyBlockChain"
+转账开始
+这是Coinbase 不做input遍历
+区块遍历完成退出
+开始挖矿......
+挖矿成功!hash: 0000015ddc62d48346687e958044ec3605f37ed63ea979ba0a1050ecb2da593a ,nonce: 119016
+转账成功!
+
+getBalance --address 17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx
+获取余额
+这是Coinbase 不做input遍历
+这是Coinbase 不做input遍历
+区块遍历完成退出
+"17wFtBYsbdfC38QQz1fekFWiQxzyHYMJdx"的余额为: 12.500000
+```
+
+### 打印区块链
+
+```shell
+==================区块高度: 0 ====================
 版本号: 0
-前区块哈希值:
-梅克尔根: 1f221bc75b0c128e862b2379479c9664e362c2a1a6513de80088179b75cb4995
-时间戳: 1551874835
+前区块的hash值： 000000fe9e383885c8288e3e46d53bbf450368495b2c966d123546cf99fd097d
+MerkelRoot: 46ccf1e4d395ce0cbbb80e3f006ab8412bd2d059e7a9f6b57aed7391d002e29b
+时间戳: 2019-03-06 21:36:22
 难度值: 0
-随机数 : 761036
-当前区块哈希值: 0000072120edcdc166a81b302c2cd71ded949e1aab0fce412ace627ddab72dac
-区块数据 :I'm genesis!
-=============== 区块高度: 1 ==============
+随机数: 119016
+当前区块的hash值： 0000015ddc62d48346687e958044ec3605f37ed63ea979ba0a1050ecb2da593a
+区块数据:  MyBlockChain
+==================区块高度: 1 ====================
 版本号: 0
-前区块哈希值: 0000072120edcdc166a81b302c2cd71ded949e1aab0fce412ace627ddab72dac
-梅克尔根: 7bb8f3d916ea5f47c7c9d01ad5e8aad9699a61f721030c9a99c76ce18ff6bb29
-时间戳: 1551874883
+前区块的hash值：
+MerkelRoot: 0d3c16e9cbde7aed7c4b72eb682a5fac9fefde2faf42fb38eee6d44a9af84cc6
+时间戳: 2019-03-06 21:30:20
 难度值: 0
-随机数 : 443064
-当前区块哈希值: 00000be134f3421ba301000686b388dce3e8704c9a4e88804e1254b17f62f62f
-区块数据 :MyCoinbase
-打印区块链完成
+随机数: 207453
+当前区块的hash值： 000000fe9e383885c8288e3e46d53bbf450368495b2c966d123546cf99fd097d
+区块数据:  创世区块
+区块遍历结束
 ```
-
-
 

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"./bolt"
+	"github.com/ShersBlockChain/bolt"
 	"log"
 )
 
@@ -11,38 +11,29 @@ type BlockChainIterator struct {
 	currentHashPointer []byte
 }
 
-//func NewIterator(bc *BlockChain)  {
-//
-//}
-
 func (bc *BlockChain) NewIterator() *BlockChainIterator {
 	return &BlockChainIterator{
 		bc.db,
-		//最初指向区块链的最后一个区块，随着Next的调用，不断变化
+		//最初指向区块链的最后一个区块hash，随着next调用不断变换
 		bc.tail,
 	}
 }
 
-//迭代器是属于区块链的
-//Next方式是属于迭代器的
-//1. 返回当前的区块
-//2. 指针前移
+//迭代器是属于区块链的，但next方法是属于迭代器的
 func (it *BlockChainIterator) Next() *Block {
 	var block Block
+	//1.返回当前区块
 	it.db.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(blockBucket))
 		if bucket == nil {
-			log.Panic("迭代器遍历时bucket不应该为空，请检查!")
+			log.Panic("迭代器遍历时，bucket不应该为空")
 		}
-
 		blockTmp := bucket.Get(it.currentHashPointer)
-		//解码动作
-		block = Deserialize(blockTmp)
-		//游标哈希左移
+		//解码
+		block = DeSerialize(blockTmp)
+		//游标hash左移
 		it.currentHashPointer = block.PrevHash
-
 		return nil
 	})
-
 	return &block
 }
